@@ -1,0 +1,29 @@
+[
+  {
+    "memberId": "1001",
+    "email": "member1001@example.com",
+    "pushToken": "mock-push-token-1001",
+    "memberLevel": "VIP",
+    "favoriteCategories": ["3C", "HOME"],
+    "lastLoginAt": "2026-06-20T10:00:00",
+    "hasCartItems": true
+  },
+  {
+    "memberId": "1002",
+    "email": "member1002@example.com",
+    "pushToken": "mock-push-token-1002",
+    "memberLevel": "GOLD",
+    "favoriteCategories": ["BEAUTY"],
+    "lastLoginAt": "2026-06-10T09:30:00",
+    "hasCartItems": false
+  },
+  {
+    "memberId": "1003",
+    "email": "member1003@example.com",
+    "pushToken": "mock-push-token-1003",
+    "memberLevel": "SILVER",
+    "favoriteCategories": ["3C"],
+    "lastLoginAt": "2026-05-28T18:45:00",
+    "hasCartItems": true
+  }
+]

@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+
+# Maven build output
+backend/target/
+
+# IDE/editor files
+.idea/
+.vscode/
+
+# Local environment files
+.env
+.env.*
