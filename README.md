@@ -21,6 +21,118 @@ Spring Boot MVP 後端服務，用於管理電商行銷活動、觸達任務、M
 
 MVP 不實作既有電商平台的基礎領域，例如會員管理、商品、訂單、優惠券、付款、購物車或庫存。
 
+## 完整操作流程
+
+這個 MVP 將「設定要觸達誰、用什麼方式觸達」與「實際執行觸達」分成兩個階段。建立 Touch Task 只會保存規則，不會立刻寄送；管理者必須另外呼叫 execute API 才會開始篩選會員與派送。
+
+```mermaid
+flowchart LR
+    A[建立 Campaign] --> B[設定 Touch Task]
+    B --> C[啟用 Campaign]
+    C --> D[執行 Touch Task]
+    D --> E[依 Audience Rule 篩選 Mock 會員]
+    E --> F[每位會員 x 每個 Channel 建立 TouchDelivery]
+    F --> G[呼叫對應 TouchProvider]
+    G --> H[記錄 SENT 或 FAILED]
+    H --> I[IN_APP 建立 MemberMessage]
+    I --> J[會員點擊並記錄 CLICK]
+    H --> K[從 TouchDelivery 統計成效]
+    J --> K
+```
+
+### 1. 建立 Campaign
+
+管理者先透過 `POST /api/admin/campaigns` 建立活動。新活動狀態為 `DRAFT`，可以先編輯活動內容並建立 Touch Task。
+
+Campaign 的主要狀態流程為：
+
+```text
+DRAFT -> ACTIVE -> PAUSED -> ACTIVE
+   |         |         |
+   +---------+---------+-> ENDED
+```
+
+- `DRAFT` 或 `PAUSED` 可以啟用為 `ACTIVE`。
+- 只有 `ACTIVE` 可以暫停為 `PAUSED`。
+- 非 `ENDED` 活動可以結束；`ENDED` 不能再次啟用。
+- Touch Task 真正執行時，Campaign 必須是 `ACTIVE`。
+
+### 2. 設定 Touch Task 與觸達條件
+
+透過 `POST /api/admin/campaigns/{campaignId}/touch-tasks` 建立任務。此步驟設定：
+
+- `audienceRule`：要觸達哪些會員。
+- `channels`：透過哪些渠道觸達，可使用 `IN_APP`、`EMAIL`、`PUSH`，不可重複。
+- `messageTitle`、`messageContent`：派送內容。
+
+目前支援的 Audience Rule：
+
+| 欄位 | 型別 | 意義 |
+| --- | --- | --- |
+| `memberLevels` | string array | 會員等級符合陣列中的任一值，例如 `VIP` 或 `GOLD` |
+| `lastLoginDaysLessThan` | positive integer | 最後登入時間在最近指定天數以內 |
+| `favoriteCategories` | string array | 會員偏好分類至少符合陣列中的一個分類 |
+| `hasCartItems` | boolean | 會員是否有購物車商品 |
+
+不同欄位之間採 **AND**；同一陣列中的值採 **OR**。未提供或為空陣列的條件不限制會員。例如：
+
+```json
+{
+  "memberLevels": ["VIP", "GOLD"],
+  "lastLoginDaysLessThan": 30,
+  "favoriteCategories": ["3C"],
+  "hasCartItems": true
+}
+```
+
+表示會員必須是 `VIP` 或 `GOLD`，同時最近 30 天內登入、偏好包含 `3C`，而且購物車內有商品。規則會以 JSONB 保存於 `touch_task.audience_rule_json`。新任務狀態為 `PENDING`，此時尚未執行任何派送。
+
+### 3. 執行 Touch Task
+
+管理者呼叫 `POST /api/admin/touch-tasks/{taskId}/execute` 後，系統依序執行：
+
+1. 確認 Touch Task 為 `PENDING`，且所屬 Campaign 為 `ACTIVE`。
+2. 將任務狀態改為 `PROCESSING`。
+3. `MockMemberProfileClient` 讀取 `backend/src/main/resources/mock/members.json`。
+4. 使用任務的 `audienceRule` 篩選符合條件的會員。
+5. 對每位目標會員的每個 channel 建立一筆 `touch_delivery`。例如 2 位會員選擇 3 個 channels，會建立 6 筆 delivery。
+6. 呼叫 channel 對應的 `TouchProvider`，並依結果將 delivery 標記為 `SENT` 或 `FAILED`。
+7. 每次成功或失敗都建立對應的 `SENT` 或 `FAILED` `campaign_event`。
+8. 所有目標會員和 channels 處理完畢後，將任務標記為 `COMPLETED`。
+
+只有 `PENDING` 任務能執行，因此 `COMPLETED` 任務不能重複執行。目前是管理者手動觸發的同步流程，MVP 沒有排程器、Queue 或背景 Worker。
+
+### 4. 各觸達渠道的行為
+
+| Channel | MVP 行為 | 建立 `member_message` | 支援點擊追蹤 |
+| --- | --- | --- | --- |
+| `IN_APP` | 模擬站內訊息派送並回傳成功 | 是，僅在派送成功時建立 | 是 |
+| `EMAIL` | Mock Provider；有 email 時回傳成功，缺少 email 時失敗，不會真的寄信 | 否 | 否 |
+| `PUSH` | Mock Provider；有 push token 時回傳成功，缺少 token 時失敗，不會真的推播 | 否 | 否 |
+
+Provider 只回傳 `DeliveryResult`，由 `TouchExecutionService` 統一更新 delivery、建立事件，並且只替成功的 `IN_APP` delivery 建立 `member_message`。
+
+### 5. 會員查詢與點擊站內訊息
+
+會員透過 `GET /api/member/messages` 搭配 `X-Member-Id` 查詢自己的站內訊息，不能查看其他會員的訊息。
+
+會員呼叫 `POST /api/member/messages/{messageId}/click` 時：
+
+- 只能點擊自己的訊息。
+- Campaign 必須仍為 `ACTIVE`。
+- 第一次點擊會把 `member_message` 和對應 `touch_delivery` 更新為已點擊，並建立一筆 `CLICK` `campaign_event`。
+- 重複點擊不會建立重複的 `CLICK` event。
+
+### 6. 查詢 Campaign Analytics
+
+管理者透過 `GET /api/admin/campaigns/{campaignId}/analytics` 查詢成效。統計以 `touch_delivery` 為主要事實來源，而不是以 `campaign_event` 計算：
+
+- 目標會員數：delivery 中不重複的 `member_id` 數量。
+- 派送數：所有 delivery 數量。
+- 成功數：狀態為 `SENT` 或 `CLICKED`。
+- 失敗數：狀態為 `FAILED`。
+- 站內訊息點擊率：`IN_APP CLICKED / IN_APP (SENT + CLICKED)`；沒有成功站內訊息時為 `0`。
+
 ## 技術棧
 
 - Java 17
@@ -176,7 +288,7 @@ API 使用 HTTP Header 模擬身份：
 ```bash
 BASE_URL="http://localhost:8080"
 ADMIN_USER="admin-demo"
-MEMBER_ID="M001"
+MEMBER_ID="1001"
 
 CAMPAIGN_ID=$(
   curl -s -X POST "$BASE_URL/api/admin/campaigns" \
@@ -294,6 +406,46 @@ The system lets an admin user:
 - Query campaign analytics from `touch_delivery`.
 
 The MVP intentionally does not implement the existing e-commerce platform domains such as member management, products, orders, coupons, payments, carts, or inventory.
+
+## End-to-End Workflow
+
+This MVP separates task configuration from task execution. Creating a Touch Task only stores its targeting rules and channels; delivery starts only when an admin explicitly calls the execute API.
+
+1. Create a Campaign with `POST /api/admin/campaigns`. A new Campaign starts in `DRAFT`.
+2. Create a Touch Task with `POST /api/admin/campaigns/{campaignId}/touch-tasks`, configuring its `audienceRule`, channels, title, and content. A new task starts in `PENDING`.
+3. Activate the Campaign. Only an `ACTIVE` Campaign can execute a task.
+4. Execute the task with `POST /api/admin/touch-tasks/{taskId}/execute`. Only a `PENDING` task can run.
+5. `MockMemberProfileClient` loads `backend/src/main/resources/mock/members.json` and applies the Audience Rule.
+6. For every matched member and every configured channel, the service creates one `touch_delivery` and calls the matching `TouchProvider`.
+7. The provider returns a `DeliveryResult`; the service records `SENT` or `FAILED` on the delivery and appends the corresponding `campaign_event`.
+8. A successful `IN_APP` delivery also creates a `member_message`. `EMAIL` and `PUSH` never create member messages.
+9. A member can query and click only their own messages. The first valid click updates the message and delivery and creates one `CLICK` event; repeated clicks are idempotent.
+10. Campaign analytics are calculated primarily from `touch_delivery`.
+
+### Audience Rule Semantics
+
+Supported fields are:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `memberLevels` | string array | Match any listed member level |
+| `lastLoginDaysLessThan` | positive integer | Last login occurred within the specified number of days |
+| `favoriteCategories` | string array | Match at least one listed favorite category |
+| `hasCartItems` | boolean | Match the member's cart-item flag |
+
+Different fields use **AND** semantics, while values inside one array use **OR** semantics. Missing fields and empty arrays do not restrict the result. The rule is stored in `touch_task.audience_rule_json`.
+
+### Execution And Channel Behavior
+
+During execution, the task moves from `PENDING` to `PROCESSING`, then to `COMPLETED` after all matched members and channels have been handled. A completed task cannot run again. Execution is synchronous and manually triggered; this MVP has no scheduler, queue, or background worker.
+
+| Channel | MVP behavior | Creates `member_message` | Click tracking |
+| --- | --- | --- | --- |
+| `IN_APP` | Simulates a successful in-app delivery | Yes, after successful delivery | Yes |
+| `EMAIL` | Mock only; succeeds when email exists and fails when missing | No | No |
+| `PUSH` | Mock only; succeeds when a push token exists and fails when missing | No | No |
+
+No real email or push message is sent in this MVP. The provider returns only a `DeliveryResult`; `TouchExecutionService` owns delivery updates, event creation, and creation of successful in-app member messages.
 
 ## Tech Stack
 
@@ -450,7 +602,7 @@ Example end-to-end demo:
 ```bash
 BASE_URL="http://localhost:8080"
 ADMIN_USER="admin-demo"
-MEMBER_ID="M001"
+MEMBER_ID="1001"
 
 CAMPAIGN_ID=$(
   curl -s -X POST "$BASE_URL/api/admin/campaigns" \
